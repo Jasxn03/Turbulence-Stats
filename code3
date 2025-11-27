@@ -1,0 +1,71 @@
+import dedalus.public as d3
+import numpy as np
+
+total_time = 1.0
+dt = 0.00001
+Re = 1000.0
+
+Lx = 2*np.pi
+Ly = 2*np.pi
+Lz = 2*np.pi
+Nx = 32
+Ny = 32
+Nz = 32
+
+tau_sx = 0.001     # nondimensional wind stress in x
+tau_sy = 0.001     # nondimensional wind stress in y
+
+xcoord = d3.Coordinate('x') 
+ycoord = d3.Coordinate('y')
+zcoord = d3.Coordinate('z')
+dist = d3.Distributor((xcoord, ycoord, zcoord), dtype=np.float64)
+xbasis = d3.Fourier(xcoord, size=Nx, bounds=(0, Lx), dealias=3/2, dtype=np.float64)
+ybasis = d3.Fourier(ycoord, size=Ny, bounds=(0, Ly), dealias=3/2, dtype=np.float64)
+# zbasis = d3.Chebyshev(zcoord, size=Nz, bounds=(0, Lz), dealias=3/2) #d3.Fourier enforces periodc bcs 
+zbasis = d3.Fourier(zcoord, size=Nz, bounds=(0, Lz), dealias=3/2, dtype=np.float64)
+
+u = dist.Field(name='u', bases=(xbasis, ybasis, zbasis))
+v = dist.Field(name='v', bases=(xbasis, ybasis, zbasis))
+w = dist.Field(name='w', bases=(xbasis, ybasis, zbasis))
+uz = dist.Field(name='uz', bases=(xbasis, ybasis, zbasis))
+vz = dist.Field(name='vz', bases=(xbasis, ybasis, zbasis))
+wz = dist.Field(name='wz', bases=(xbasis, ybasis, zbasis))
+p = dist.Field(name='p', bases=(xbasis, ybasis, zbasis))
+tau_p = dist.Field(name='tau_p', bases=None)
+
+dx = lambda A: d3.Differentiate(A, xcoord)
+dy = lambda A: d3.Differentiate(A, ycoord)
+dz = lambda A: d3.Differentiate(A, zcoord)
+
+problem = d3.IVP([u, v, w, uz, vz, wz, p, tau_p], namespace={"Re":Re, "dx":dx, "dy":dy, "dz":dz,'Lz':Lz})
+
+problem.add_equation("dx(u) + dy(v) + wz + tau_p = 0")
+problem.add_equation("dt(u) - (1/Re)*(dx(dx(u)) + dy(dy(u)) + dz(uz)) + dx(p) = - u*dx(u) - v*dy(u) - w*uz")
+problem.add_equation("dt(v) - (1/Re)*(dx(dx(v)) + dy(dy(v)) + dz(vz)) + dy(p) = - u*dx(v) - v*dy(v) - w*vz")
+problem.add_equation("dt(w) - (1/Re)*(dx(dx(w)) + dy(dy(w)) + dz(wz)) + dz(p) = - u*dx(w) - v*dy(w) - w*wz")
+problem.add_equation("uz - dz(u) = 0")
+problem.add_equation("vz - dz(v) = 0")
+problem.add_equation("wz - dz(w) = 0")
+problem.add_equation("integ(p) = 0")
+
+U0 = 1
+u['g'][:] = U0
+v['g'][:] = 0
+w['g'][:] = 0
+p['g'][:] = 0
+
+# Add small random perturbations to the velocity fields
+np.random.seed(42)
+epsilon = 0.01 * U0 
+u['g'] += epsilon * np.random.randn(*u['g'].shape)
+v['g'] += epsilon * np.random.randn(*v['g'].shape)
+w['g'] += epsilon * np.random.randn(*w['g'].shape)
+
+solver = problem.build_solver(d3.RK443)
+solver.stop_sim_time = total_time
+
+while solver.proceed:
+    solver.step(dt)
+    t = solver.sim_time
+    if solver.iteration % 100 == 0:
+        print(f"Iteration: {solver.iteration}, Time: {t:.3f}")
