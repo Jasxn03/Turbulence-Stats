@@ -8,6 +8,8 @@
 # MY GRID BOX IS 32x32x32 IS DISCRETIZED BY 32 POINTS - 2PI/32 = 0.2 this takes 4mins for t = 3 and dt = 0.001
 #
 # t=50 and ou forcing turbulence, the vortex gets pushed away? this shows transport possibily?
+#
+# this is velocity based forcing 
 
 
 import dedalus.public as d3
@@ -16,16 +18,16 @@ from matplotlib.pylab import seed
 import numpy as np
 import time
 
-total_time = 15.0
+total_time = 1.0
 dt = 0.001
 Re = 1000.0
 
 Lx = 2*np.pi
 Ly = 2*np.pi
 Lz = 2*np.pi
-Nx = 128
-Ny = 128
-Nz = 128
+Nx = 32
+Ny = 32
+Nz = 32
 
 xcoord = d3.Coordinate('x') 
 ycoord = d3.Coordinate('y')
@@ -114,7 +116,7 @@ def forcing(u,v,w, kmax=5, tau = 0.5, sigma=0.5):
     dw = sigma * rng.standard_normal(shape) * mask
 
     alpha = np.exp(-dt/tau)
-    beta = np.sqrt(1-alpha**2)
+    beta = np.sqrt(tau/2 * (1-alpha**2))
 
     u['g'][:] = alpha*u['g'] + beta*du
     v['g'][:] = alpha*v['g'] + beta*dv

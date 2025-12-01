@@ -1,0 +1,97 @@
+# this vectorised version for code 2, no forcing though
+
+import dedalus.public as d3
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+
+total_time = 1.0
+dt = 0.001
+Re = 1000.0
+
+Lx = 2*np.pi
+Ly = 2*np.pi
+Lz = 2*np.pi
+Nx = 32
+Ny = 32
+Nz = 32
+
+coords = d3.CartesianCoordinates('x', 'y', 'z')
+dist = d3.Distributor(coords, dtype=np.float64)
+xbasis = d3.Fourier(coords[0], size=Nx, bounds=(0, Lx), dealias=3/2, dtype=np.float64)
+ybasis = d3.Fourier(coords[1], size=Ny, bounds=(0, Ly), dealias=3/2, dtype=np.float64)
+zbasis = d3.Fourier(coords[2], size=Nz, bounds=(0, Lz), dealias=3/2, dtype=np.float64) 
+
+p = dist.Field(name='p', bases=(xbasis,ybasis,zbasis))
+u = dist.VectorField(coords, name='u', bases=(xbasis,ybasis,zbasis))
+tau_p = dist.Field(name='tau_p')
+tau_u = dist.VectorField(coords, name='tau_u')
+dx = lambda A: d3.Differentiate(A, coords[0])
+dy = lambda A: d3.Differentiate(A, coords[1])
+dz = lambda A: d3.Differentiate(A, coords[2])
+div = lambda A: d3.Divergence(A)
+grad = lambda A: d3.Gradient(A)
+lap = lambda A: d3.Laplacian(A)
+grad_u = grad(u)
+
+
+problem = d3.IVP([p, u, tau_p, tau_u], namespace={"Re":Re, "grad_u":grad_u})
+problem.add_equation("dt(u) - div(grad_u)/Re + grad(p) + tau_u = -u@grad(u)") 
+problem.add_equation("div(u) + tau_p = 0")
+problem.add_equation("integ(p) = 0") 
+problem.add_equation("integ(u) = 0") # adding this seems to fix the nonsquare system, i needed 3 more equations.
+
+#---------------------------------------------------------------------
+# taylor green vortex ic  for turbulence
+# Add small random perturbations to the velocity fields
+U0 = 1
+kx = ky = kz = 1
+x = dist.local_grids(xbasis, ybasis, zbasis)[0]
+y = dist.local_grids(xbasis, ybasis, zbasis)[1]
+z = dist.local_grids(xbasis, ybasis, zbasis)[2]
+u['g'][:][0] = U0 * np.sin(kx*x) * np.cos(ky*y)*np.cos(kz*z)
+u['g'][:][1] = -U0 * np.cos(kx*x)* np.sin(ky*y) * np.cos(kz*z)
+u['g'][:][2] = 0
+p['g'][:] = 0
+#---------------------------------------------------------------------
+start_time = time.time()
+
+solver = problem.build_solver(d3.RK443)
+solver.stop_sim_time = total_time
+
+while solver.proceed:
+    solver.step(dt)
+    t = solver.sim_time
+    if solver.iteration % 100 == 0:
+        print(f"Iteration: {solver.iteration}, Time: {t:.3f}")
+
+end_time = time.time()
+print(f"Simulation completed in {end_time - start_time:.2f} seconds.")
+
+#---------------------------------------------------------------------
+xg, yg, zg = dist.local_grids(xbasis, ybasis, zbasis)
+print(u['g'].shape)
+_, Nx_local, Ny_local, Nz_local = u['g'].shape
+
+x1d = np.linspace(0, Lx, Nx_local, endpoint=False)
+y1d = np.linspace(0, Ly, Ny_local, endpoint=False)
+z1d = np.linspace(0, Lz, Nz_local, endpoint=False)
+
+x2d, y2d = np.meshgrid(x1d, y1d, indexing='ij')
+
+slice_z_idx = Nz_local // 2
+
+# Extract slices
+u_slice = u['g'][:, :, slice_z_idx][0]
+v_slice = u['g'][:, :, slice_z_idx][1]
+w_slice = u['g'][:, :, slice_z_idx][2]
+
+u2 = u_slice.T
+v2 = v_slice.T
+
+plt.figure(figsize=(8,6))
+plt.contourf(x2d, y2d, u_slice, 40, cmap='RdBu_r')
+plt.colorbar(label="u velocity")
+plt.xlabel("x"); plt.ylabel("y")
+plt.title("u velocity slice")
+plt.show()

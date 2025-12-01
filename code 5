@@ -1,0 +1,405 @@
+# this is code 2 but with acceleration based forcing like in eswaran and pope 1988
+
+import dedalus.public as d3
+import matplotlib.pylab as plt 
+from matplotlib.pylab import seed
+import numpy as np
+import time
+
+total_time = 15.0
+dt = 0.001
+Re = 1000.0
+
+Lx = 2*np.pi
+Ly = 2*np.pi
+Lz = 2*np.pi
+Nx = 32
+Ny = 32
+Nz = 32
+
+xcoord = d3.Coordinate('x') 
+ycoord = d3.Coordinate('y')
+zcoord = d3.Coordinate('z')
+dist = d3.Distributor((xcoord, ycoord, zcoord), dtype=np.float64)
+xbasis = d3.Fourier(xcoord, size=Nx, bounds=(0, Lx), dealias=3/2, dtype=np.float64)
+ybasis = d3.Fourier(ycoord, size=Ny, bounds=(0, Ly), dealias=3/2, dtype=np.float64)
+zbasis = d3.Fourier(zcoord, size=Nz, bounds=(0, Lz), dealias=3/2, dtype=np.float64) #d3.Fourier enforces periodc bcs 
+
+u = dist.Field(name='u', bases=(xbasis, ybasis, zbasis))
+v = dist.Field(name='v', bases=(xbasis, ybasis, zbasis))
+w = dist.Field(name='w', bases=(xbasis, ybasis, zbasis))
+
+f_u_hat = np.zeros(u['g'].shape, dtype=np.float64)
+f_v_hat = np.zeros(v['g'].shape, dtype=np.float64)
+f_w_hat = np.zeros(w['g'].shape, dtype=np.float64)
+
+
+f_u = dist.Field(name='f_u', bases=(xbasis, ybasis, zbasis))
+f_v = dist.Field(name='f_v', bases=(xbasis, ybasis, zbasis))
+f_w = dist.Field(name='f_w', bases=(xbasis, ybasis, zbasis))
+f_u['c'][:] = 0
+f_v['c'][:] = 0
+f_w['c'][:] = 0
+
+p = dist.Field(name='p', bases=(xbasis, ybasis, zbasis))
+
+dx = lambda A: d3.Differentiate(A, xcoord)
+dy = lambda A: d3.Differentiate(A, ycoord)
+dz = lambda A: d3.Differentiate(A, zcoord)
+div = lambda A, B, C: dx(A) + dy(B) + dz(C)
+lap = lambda A: dx(dx(A)) + dy(dy(A)) + dz(dz(A))
+grad = lambda A: (dx(A), dy(A), dz(A))
+
+tau_p = dist.Field(name='tau_p', bases=None)
+
+problem = d3.IVP([u, v, w, p, tau_p], namespace={"Re":Re, "dx":dx, "dy":dy, "dz":dz, "div":div, "lap":lap, 'Lz':Lz})
+
+problem.add_equation("dt(u) - (1/Re)*lap(u) + dx(p) = -u*dx(u) - v*dy(u) - w*dz(u)")
+problem.add_equation("dt(v) - (1/Re)*lap(v) + dy(p) = -u*dx(v) - v*dy(v) - w*dz(v)")
+problem.add_equation("dt(w) - (1/Re)*lap(w) + dz(p) = -u*dx(w) - v*dy(w) - w*dz(w)")
+problem.add_equation("div(u, v, w) + tau_p = 0")
+problem.add_equation("integ(p) = 0")
+
+#---------------------------------------------------------------------
+
+# taylor green vortex ic  for turbulence
+# Add small random perturbations to the velocity fields
+U0 = 1
+kx = ky = kz = 1
+x = dist.local_grids(xbasis, ybasis, zbasis)[0]
+y = dist.local_grids(xbasis, ybasis, zbasis)[1]
+z = dist.local_grids(xbasis, ybasis, zbasis)[2]
+u['g'][:] = U0 * np.sin(kx*x) * np.cos(ky*y)*np.cos(kz*z)
+v['g'][:] = -U0 * np.cos(kx*x)* np.sin(ky*y) * np.cos(kz*z)
+w['g'][:] = 0
+p['g'][:] = 0
+# can keep the small pertubation after if want to
+#---------------------------------------------------------------------
+
+# apparently this is not good 
+# Add small random perturbations to the velocity fields
+# U0 = 1
+# u['g'][:] = U0
+# v['g'][:] = 0
+# w['g'][:] = 0
+# p['g'][:] = 0
+# np.random.seed(42)
+# epsilon = 0.01 * U0 
+# u['g'] += epsilon * np.random.randn(*u['g'].shape)
+# v['g'] += epsilon * np.random.randn(*v['g'].shape)
+# w['g'] += epsilon * np.random.randn(*w['g'].shape)
+
+#---------------------------------------------------------------------
+
+# potential ou initial forcing to initiate turbulence
+
+rng = np.random.default_rng(123)
+
+def update_OU(f_field, kmax=5, tau = 0.5, sigma=0.5):
+    
+    f_hat = f_field['c']  
+
+    kx = (2 * np.pi)/Lx * xbasis.wavenumbers
+    ky = (2 * np.pi)/Ly * ybasis.wavenumbers
+    kz = (2 * np.pi)/Lz * zbasis.wavenumbers
+
+    KX, KY, KZ = np.meshgrid(kx, ky, kz, indexing='ij')
+    K2 = KX**2 + KY**2 + KZ**2
+    mask = (K2 > 0) & (np.sqrt(K2) <= kmax)
+
+    alpha = np.exp(-dt / tau)
+    beta = np.sqrt(tau / 2 * (1 - alpha**2)) * sigma
+
+    eta = rng.standard_normal(f_hat.shape)
+
+    f_hat[:] = alpha * f_hat + beta * eta * mask
+
+#---------------------------------------------------------------------
+
+# now scary stress stuff that hopefully works
+
+def stress_calc(u,v,w,p,Re, xp, yp, zp):
+
+    Sxx = dx(u)
+    Syy = dy(v)
+    Szz = dz(w)
+    Sxy = 0.5*(dy(u) + dx(v))
+    Sxz = 0.5*(dz(u) + dx(w))
+    Syz = 0.5*(dz(v) + dy(w))   
+
+    sigma_xx = -p + (2/Re)*Sxx
+    sigma_yy = -p + (2/Re)*Syy
+    sigma_zz = -p + (2/Re)*Szz
+    sigma_xy = (2/Re)*Sxy
+    sigma_xz = (2/Re)*Sxz
+    sigma_yz = (2/Re)*Syz
+
+    Sxx_g = sigma_xx.evaluate()['g']
+    Syy_g = sigma_yy.evaluate()['g']
+    Szz_g = sigma_zz.evaluate()['g']
+    Sxy_g = sigma_xy.evaluate()['g']
+    Sxz_g = sigma_xz.evaluate()['g']
+    Syz_g = sigma_yz.evaluate()['g']
+
+    ix = int(xp/Lx * Nx) % Nx
+    iy = int(yp/Ly * Ny) % Ny
+    iz = int(zp/Lz * Nz) % Nz
+
+    S_mag = np.sqrt(Sxx_g[ix,iy,iz]**2 + Syy_g[ix,iy,iz]**2 + Szz_g[ix,iy,iz]**2 +
+                    2*(Sxy_g[ix,iy,iz]**2 + Sxz_g[ix,iy,iz]**2 + Syz_g[ix,iy,iz]**2))
+
+    return{"S_mag": S_mag} 
+
+xp = Lx/2
+yp = Ly/2
+zp = Lz/2
+
+time_list = []
+sigma_xx_list = []
+sigma_yy_list = []
+sigma_zz_list = []
+sigma_xy_list = []
+sigma_xz_list = []
+sigma_yz_list = []
+S_mag_list = []
+
+#---------------------------------------------------------------------
+
+def stress_fields(u,v,w,p,Re):
+    """Return full 3D stress fields as numpy arrays."""
+    Sxx = dx(u)
+    Syy = dy(v)
+    Szz = dz(w)
+    Sxy = 0.5*(dy(u) + dx(v))
+    Sxz = 0.5*(dz(u) + dx(w))
+    Syz = 0.5*(dz(v) + dy(w))   
+
+    sigma_xx = (-p + (2/Re)*Sxx).evaluate()['g']
+    sigma_yy = (-p + (2/Re)*Syy).evaluate()['g']
+    sigma_zz = (-p + (2/Re)*Szz).evaluate()['g']
+    sigma_xy = ((2/Re)*Sxy).evaluate()['g']
+    sigma_xz = ((2/Re)*Sxz).evaluate()['g']
+    sigma_yz = ((2/Re)*Syz).evaluate()['g']
+
+    sigma_fields = {
+        'sigma_xx': sigma_xx,
+        'sigma_yy': sigma_yy,
+        'sigma_zz': sigma_zz,
+        'sigma_xy': sigma_xy,
+        'sigma_xz': sigma_xz,
+        'sigma_yz': sigma_yz,
+    }
+
+    return sigma_fields
+#---------------------------------------------------------------------
+
+def stress_spectra(sigma_fields, Lx, Ly, Lz, nbins=None):
+
+    Nx, Ny, Nz = next(iter(sigma_fields.values())).shape
+    N = Nx * Ny * Nz
+
+    sigma_h = {name: np.fft.fftn(arr) for name, arr in sigma_fields.items()}
+    S_mode = {name: np.abs(arr.ravel())**2 for name, arr in sigma_h.items()}
+
+    kx = 2*np.pi * np.fft.fftfreq(Nx, d=Lx/Nx)
+    ky = 2*np.pi * np.fft.fftfreq(Ny, d=Ly/Ny)
+    kz = 2*np.pi * np.fft.fftfreq(Nz, d=Lz/Nz)
+    KX, KY, KZ = np.meshgrid(kx, ky, kz, indexing='ij')
+    Kmag = np.sqrt(KX**2 + KY**2 + KZ**2).ravel()
+
+    kmax = Kmag.max()
+    if nbins is None:
+        nbins = int(np.floor(kmax)) + 1
+
+    edges = np.linspace(0, kmax, nbins + 1)
+    k_bins = 0.5 * (edges[:-1] + edges[1:])
+    bin_idx = np.digitize(Kmag, edges) - 1
+    valid = (bin_idx >= 0) & (bin_idx < nbins)
+
+    S_sigma_k = {name: np.zeros(nbins) for name in sigma_fields}
+    counts = np.zeros(nbins, dtype=int)
+
+    for b in range(nbins):
+        mask = (bin_idx == b) & valid
+        counts[b] = np.count_nonzero(mask)
+        if counts[b] > 0:
+            for name, arr in S_mode.items():
+                S_sigma_k[name][b] = arr[mask].mean()
+
+    return k_bins, S_sigma_k
+#---------------------------------------------------------------------
+
+
+nbins = 32
+S_sigma_k_accum = None
+snapshot_count = 0
+snapshot_interval = 100
+
+
+start_time = time.time()
+
+solver = problem.build_solver(d3.RK443)
+solver.stop_sim_time = total_time
+
+while solver.proceed:
+
+    update_OU(f_u, kmax=5, tau = 0.5, sigma=0.5)
+    update_OU(f_v, kmax=5, tau = 0.5, sigma=0.5)
+    update_OU(f_w, kmax=5, tau = 0.5, sigma=0.5)
+
+    f_u.require_grid_space()
+    f_v.require_grid_space()    
+    f_w.require_grid_space()    
+
+    u['c'] += dt * f_u['c']
+    v['c'] += dt * f_v['c']
+    w['c'] += dt * f_w['c']
+
+    solver.step(dt)
+    t = solver.sim_time
+
+    # this bit uses the stress calc
+    stress = stress_calc(u,v,w,p,Re, xp, yp, zp)
+    time_list.append(t)
+    S_mag_list.append(stress["S_mag"])
+
+    if solver.iteration % snapshot_interval == 0:
+        sigma_fields_3d = stress_fields(u, v, w, p, Re)
+
+        k_bins, S_sigma_k_snapshot = stress_spectra(sigma_fields_3d, Lx, Ly, Lz, nbins=nbins)
+
+        if S_sigma_k_accum is None:
+            S_sigma_k_accum = {name: S_sigma_k_snapshot[name].copy() for name in S_sigma_k_snapshot}
+        else:
+            for name in S_sigma_k_snapshot:
+                S_sigma_k_accum[name] += S_sigma_k_snapshot[name]
+
+        snapshot_count += 1
+
+    if solver.iteration % 100 == 0:
+        print(f"Iteration: {solver.iteration}, Time: {t:.3f}")
+
+    
+end_time = time.time()
+print(f"Simulation completed in {end_time - start_time:.2f} seconds.")
+
+print("Max S_mag:", np.max(stress_calc(u,v,w,p,Re,xp,yp,zp)))
+
+# plot pls work
+plt.figure(figsize=(10, 6))
+plt.plot(time_list, S_mag_list, label='S_mag')
+plt.xlabel('Time')
+plt.ylabel('Cauchy Stress Magnitude')
+plt.title('Cauchy Stress Magnitude Over Time at Point (%.2f, %.2f, %.2f)' % (xp, yp, zp))
+plt.legend()
+plt.show()
+
+
+
+
+#---------------------------------------------------------------------
+
+import scipy.stats as stats
+
+S_mag_arr = np.array(S_mag_list)
+
+stats_dict = {
+    "mean": np.mean(S_mag_arr),
+    "variance": np.var(S_mag_arr),
+    "std_dev": np.std(S_mag_arr),
+    "min": np.min(S_mag_arr),
+    "max": np.max(S_mag_arr),
+    "median": np.median(S_mag_arr),
+    "skewness": stats.skew(S_mag_arr),
+    "kurtosis": stats.kurtosis(S_mag_arr),
+}
+
+print("Stress statistics (S_mag):")
+for key, value in stats_dict.items():
+    print(f"{key:10s}: {value:.6f}")
+
+plt.figure()
+plt.hist(S_mag_arr, bins=50, density=True)
+plt.xlabel("S_mag")
+plt.ylabel("PDF")
+plt.title("Probability Density of Stress Magnitude")
+plt.show()
+
+pdf_vals, bin_edges = np.histogram(S_mag_arr, bins=50, density=True)
+
+from sklearn.mixture import GaussianMixture
+
+# reshape to column vector (sklearn requirement)
+data = S_mag_arr.reshape(-1, 1)
+
+# choose number of Gaussian components
+K = 2  
+
+gmm = GaussianMixture(n_components=K, covariance_type='full', random_state=0)
+gmm.fit(data)
+
+print("Weights:", gmm.weights_)
+print("Means:", gmm.means_.flatten())
+print("Stds:", np.sqrt(gmm.covariances_).flatten())
+
+x_grid = np.linspace(S_mag_arr.min(), S_mag_arr.max(), 500).reshape(-1, 1)
+pdf_gmm = np.exp(gmm.score_samples(x_grid))
+
+plt.figure(figsize=(8,5))
+plt.hist(S_mag_arr, bins=50, density=True, alpha=0.5, label='Histogram PDF')
+plt.plot(x_grid, pdf_gmm, label=f'GMM (K={K})')
+plt.xlabel("S_mag")
+plt.ylabel("PDF")
+plt.title("GMM Fit for Stress Magnitude PDF")
+plt.legend()
+plt.show()
+
+def autocorr(x):
+    x = x - np.mean(x)
+    result = np.correlate(x, x, mode='full')
+    return result[result.size // 2:] / result[result.size // 2]
+
+R = autocorr(S_mag_arr)
+
+plt.figure()
+plt.plot(R)
+plt.title("Autocorrelation of Stress Magnitude")
+plt.xlabel("Lag")
+plt.ylabel("Correlation")
+plt.show()
+
+S_sigma_k_timeavg = {name: S_sigma_k_accum[name]/snapshot_count for name in S_sigma_k_accum}
+
+
+S_values = [S_k[1:] for S_k in S_sigma_k_timeavg.values()]
+ymin = min([np.min(S) for S in S_values])
+ymax = max([np.max(S) for S in S_values])
+
+names = list(S_sigma_k_timeavg.keys())
+n = len(names)
+
+rows, cols = 2, 3
+fig, axes = plt.subplots(rows, cols, figsize=(10, 6), sharex=True, sharey=True)
+axes = axes.flatten()
+
+for ax, name in zip(axes, names):
+    S_k = S_sigma_k_timeavg[name]
+    ax.loglog(k_bins[1:], S_k[1:], '-o')
+    ax.set_title(name)
+    ax.grid(True, which='both')
+    ax.set_ylim(ymin, ymax)
+
+# label only bottom row + left column
+for i, ax in enumerate(axes):
+    if i // cols == rows - 1:   # bottom row
+        ax.set_xlabel('k')
+    if i % cols == 0:           # first column
+        ax.set_ylabel('S(k)')
+
+# hide any unused subplots (in case n < rows*cols)
+for j in range(n, rows * cols):
+    fig.delaxes(axes[j])
+
+fig.suptitle('Time-averaged Stress Spectra', y=0.95)
+plt.tight_layout()
+plt.show()
